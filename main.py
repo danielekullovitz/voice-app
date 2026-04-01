@@ -31,27 +31,25 @@ async def analyze_voice(file: UploadFile = File(...)):
         y, sr = librosa.load(temp_path, sr=None)
         
         # --- ADVANCED BIOMARKERS ---
-        # 1. Jitter (Pitch Instability)
-        pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
-        f0 = np.mean(pitches[pitches > 0]) if np.any(pitches > 0) else 120.0
-        jitter = np.std(librosa.feature.mfcc(y=y, sr=sr)[0]) / 100
+               # --- ENGINE V4: THE BIOMETRIC GOLD STANDARD ---
         
-        # 2. Shimmer (Amplitude Instability)
-        shimmer = np.std(librosa.feature.rms(y=y)[0]) / 10
+        # 1. Jitter & Shimmer (Standardized)
+        jitter_score = min(100, (jitter * 60))
+        shimmer_score = min(100, (shimmer * 50))
         
-        # 3. HARSHNESS (The "Monster Growl" Detector)
-        flatness = np.mean(librosa.feature.spectral_flatness(y=y))
+        # 2. Tension: Now heavily weighted by 'Flatness' (the Growl detector)
+        # Flatness represents noise. Growls have high flatness.
+        tension_raw = (jitter_score * 0.3) + (shimmer_score * 0.2) + (flatness * 600)
+        tension = int(min(100, max(10, tension_raw)))
         
-        # --- TUNED CALIBRATION ---
-        # If flatness is high (growly/noisy), Tension spikes automatically
-        tension_raw = (jitter * 100) + (shimmer * 100) + (flatness * 500)
-        tension = int(min(100, max(15, tension_raw)))
+        # 3. Vitality: Rewards a clear, stable voice. 
+        # We subtract Tension from Vitality so you CANNOT have a high score if you are straining.
+        base_vitality = 100 - (flatness * 500) - (shimmer_score * 0.5)
+        vitality = int(base_vitality - (tension * 0.2)) # Tension "drains" vitality
+        vitality = max(20, min(100, vitality))
         
-        # Vitality is "Brightness" - Growls are dark, so Vitality should drop
-        vitality = int(100 - (flatness * 400) - (shimmer * 100))
-        vitality = max(30, min(100, vitality))
-        
-        vrs_score = int((100 - tension) * 0.4 + vitality * 0.6)
+        # 4. FINAL VRS: The true "Health" score
+        vrs_score = int((100 - tension) * 0.5 + vitality * 0.5)
 
         result = {
             "vrs": vrs_score,
