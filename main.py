@@ -57,7 +57,8 @@ async def analyze_voice(file: UploadFile = File(...)):
         # New VRS Weighting: Vitality carries more weight for a "Wellness" feel
         vrs_score = int((100 - tension) * 0.3 + vitality * 0.7)
 
-        return {
+                # Create the result dictionary
+        result = {
             "vrs": vrs_score,
             "tension": int(tension),
             "vitality": int(vitality),
@@ -65,6 +66,11 @@ async def analyze_voice(file: UploadFile = File(...)):
             "shimmer": f"{shimmer:.2%}",
             "f0": f"{f0:.2f} Hz"
         }
+        
+        # THIS IS THE NEW LINE: It prints the numbers to your Railway Logs
+        print(f"--- ENGINE ANALYSIS: {result} ---")
+        
+        return result
 
     except Exception as e:
         print(f"Error during analysis: {str(e)}")
