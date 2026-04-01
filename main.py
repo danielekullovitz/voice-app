@@ -32,23 +32,25 @@ async def analyze_voice(file: UploadFile = File(...)):
         # --- ADVANCED BIOMARKERS ---
                # --- ENGINE V4: THE BIOMETRIC GOLD STANDARD ---
         
-        # 1. Jitter & Shimmer (Standardized)
-        jitter_score = min(100, (jitter * 60))
-        shimmer_score = min(100, (shimmer * 50))
+                # --- ENGINE V5: THE SCORE KILLER ---
         
-        # 2. Tension: Now heavily weighted by 'Flatness' (the Growl detector)
-        # Flatness represents noise. Growls have high flatness.
-        tension_raw = (jitter_score * 0.3) + (shimmer_score * 0.2) + (flatness * 600)
-        tension = int(min(100, max(10, tension_raw)))
+        # 1. TENSION (The Penalty)
+        # We multiply Flatness by 1000 to make sure growls spike Tension instantly.
+        tension_calc = (jitter * 400) + (flatness * 1000)
+        tension = int(min(100, max(15, tension_calc)))
         
-        # 3. Vitality: Rewards a clear, stable voice. 
-        # We subtract Tension from Vitality so you CANNOT have a high score if you are straining.
-        base_vitality = 100 - (flatness * 500) - (shimmer_score * 0.5)
-        vitality = int(base_vitality - (tension * 0.2)) # Tension "drains" vitality
-        vitality = max(20, min(100, vitality))
+        # 2. VITALITY (The Power)
+        # A growl is "noisy," so high flatness must CRUSH vitality.
+        vitality_calc = 100 - (shimmer * 250) - (flatness * 800)
+        vitality = int(min(100, max(10, vitality_calc)))
         
-        # 4. FINAL VRS: The true "Health" score
-        vrs_score = int((100 - tension) * 0.5 + vitality * 0.5)
+        # 3. VRS (The Final Health Score)
+        # Formally: (Healthy Buffer + Vitality) / 2
+        # If Tension is 80, your "Healthy Buffer" is only 20.
+        vrs_score = int(((100 - tension) + vitality) / 2)
+        
+        # 4. COG SPEED (Just for the UI - based on pitch stability)
+        cog_speed = int(max(40, 100 - (jitter * 500)))
 
         result = {
             "vrs": vrs_score,
