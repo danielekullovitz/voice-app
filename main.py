@@ -30,28 +30,7 @@ async def analyze_voice(file: UploadFile = File(...)):
         y, sr = librosa.load(temp_path, sr=None)
         
         # --- ADVANCED BIOMARKERS ---
-               # --- ENGINE V4: THE BIOMETRIC GOLD STANDARD ---
-        
-                # --- ENGINE V5: THE SCORE KILLER ---
-        
-        # 1. TENSION (The Penalty)
-        # We multiply Flatness by 1000 to make sure growls spike Tension instantly.
-        tension_calc = (jitter * 400) + (flatness * 1000)
-        tension = int(min(100, max(15, tension_calc)))
-        
-        # 2. VITALITY (The Power)
-        # A growl is "noisy," so high flatness must CRUSH vitality.
-        vitality_calc = 100 - (shimmer * 250) - (flatness * 800)
-        vitality = int(min(100, max(10, vitality_calc)))
-        
-        # 3. VRS (The Final Health Score)
-        # Formally: (Healthy Buffer + Vitality) / 2
-        # If Tension is 80, your "Healthy Buffer" is only 20.
-        vrs_score = int(((100 - tension) + vitality) / 2)
-        
-        # 4. COG SPEED (Just for the UI - based on pitch stability)
-        cog_speed = int(max(40, 100 - (jitter * 500)))
-
+            https://id-preview--9c404639-9fe2-4b60-863c-466d1a5ad956.lovable.app
         result = {
             "vrs": vrs_score,
             "tension": tension,
