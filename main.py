@@ -1,49 +1,52 @@
 """
-Vocal Biomarker API v2 — Recalibrated for Real iPhone Recordings
-=================================================================
-Fixed from v1 based on real-world test results showing both normal voice
-and growl scoring identically (~43-44 VRS, 76.9 tension for both).
+Vocal Biomarker API v3 — Rebuilt for iPhone Reality
+=====================================================
 
-Root Cause Analysis & Fixes
------------------------------
-1. HPSS margin=3.0 was too aggressive — it over-separated, making even
-   normal speech look percussive. Changed to margin=1.5 (default-ish)
-   which preserves the natural harmonic dominance of clean speech.
+Why v1 and v2 failed
+---------------------
+Both versions relied on spectral-domain features (HPSS harmonic ratio,
+spectral bandwidth, spectral rolloff) that are neutralised by iPhone
+Automatic Gain Control (AGC) and built-in compression. The phone's
+signal processing normalises level, boosts mid-range, and compresses
+dynamics — making a deep growl look spectrally similar to normal speech
+in the processed recording.
 
-2. Spectral bandwidth norms were textbook values, not iPhone-at-22kHz
-   values. Replaced with empirically grounded norms for smartphone
-   recordings resampled to 22050 Hz.
+v3 Strategy: Use features that survive phone processing
+-------------------------------------------------------
+iPhone AGC cannot hide these properties:
 
-3. MFCC variance was compared to a floor of 8.0 which was too low for
-   real recordings. The real discriminator is that growl has LOW temporal
-   standard deviation in mid-MFCCs (coefficients 2-6 barely change
-   frame to frame) while normal speech has HIGH std. Recalibrated.
+1. **F0 (Pitch) Statistics** — A deep growl has abnormally LOW fundamental
+   frequency (often <90 Hz for males, <140 Hz for females) with HIGH
+   irregularity (jitter in F0 track, not waveform jitter). Normal speech
+   has higher F0 with smooth prosodic contour.
 
-4. The tension sigmoid was centred at 0.40 with slope 12 — meaning
-   even a modest raw_strain of 0.3 was already scoring ~60 tension.
-   Recentred at 0.35 with slope 8 so normal speech lands at 10-25.
+2. **Cepstral Peak Prominence (CPP)** — The gold standard in clinical
+   voice assessment. CPP measures how clearly the voice's fundamental
+   period stands out in the cepstrum. Normal phonation: strong, clear
+   cepstral peak (high CPP). Vocal fry/growl: weak, smeared peak
+   (low CPP) because subharmonic and aperiodic energy disrupt the
+   periodicity. CPP is robust to recording conditions because it's a
+   RATIO measure.
 
-5. Added SPECTRAL ROLLOFF (85th percentile) — the frequency below which
-   85% of spectral energy lives. Normal speech: 3000-5000 Hz. Deep
-   growl: 800-1800 Hz. This is the single strongest discriminator and
-   is robust to iPhone noise.
+3. **F0 Contour Regularity** — Normal speech has smooth F0 transitions
+   (prosody). Vocal fry produces erratic F0 jumps, dropouts, and
+   subharmonic halving. We measure this as the coefficient of variation
+   and the percentage of "unvoiced" frames (where pyin can't find F0).
 
-6. Cog speed onset detection threshold tightened (1.5*MAD vs 1.2*MAD)
-   with 120ms minimum inter-onset to avoid double-counting.
+4. **Low-to-High Energy Ratio (Spectral Tilt)** — Even with AGC, the
+   RATIO of energy below 500 Hz to energy above 2000 Hz differs
+   dramatically: growl concentrates energy low, normal speech spreads it.
+   AGC scales the whole spectrum but preserves the ratio.
 
-Frontend Note
---------------
-The /analyze endpoint expects multipart/form-data with fields:
-  - file: audio blob
-  - is_smoker: "true" or "false" (string)
-  - gender: "male", "female", or "other" (string)
-Do NOT set Content-Type header manually — let the browser set the
-multipart boundary automatically.
+5. **Syllable Rate with Completion Estimate** — Now estimates what
+   fraction of expected speech was actually produced, so an incomplete
+   phrase correctly reduces cog_speed.
+
+Frontend Note: multipart/form-data, do NOT set Content-Type manually.
 """
 
 from __future__ import annotations
 
-import io
 import logging
 import tempfile
 from pathlib import Path
@@ -56,20 +59,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("vocal_biomarker")
 
-# ---------------------------------------------------------------------------
-# App
-# ---------------------------------------------------------------------------
-app = FastAPI(
-    title="Vocal Biomarker API",
-    version="2.0.0",
-    description="Medical-grade vocal resilience scoring from audio uploads.",
-)
-
+app = FastAPI(title="Vocal Biomarker API", version="3.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -77,17 +70,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------------------------
-# Response schema
-# ---------------------------------------------------------------------------
-
 
 class BiomarkerResult(BaseModel):
-    vrs: float = Field(..., ge=0, le=100, description="Vocal Resilience Score")
-    tension: float = Field(..., ge=0, le=100, description="Physical vocal tension")
-    vitality: float = Field(..., ge=0, le=100, description="Vocal vitality / health")
-    cog_speed: float = Field(..., ge=0, le=100, description="Cognitive-articulatory speed")
-    debug: Optional[dict] = Field(None, description="Raw feature values for debugging")
+    vrs: float = Field(..., ge=0, le=100)
+    tension: float = Field(..., ge=0, le=100)
+    vitality: float = Field(..., ge=0, le=100)
+    cog_speed: float = Field(..., ge=0, le=100)
+    debug: Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------
@@ -97,86 +86,65 @@ TARGET_SR = 22050
 MIN_DURATION_SEC = 0.6
 PRE_EMPHASIS_COEFF = 0.97
 
-# Gender-adjusted norms for smartphone recordings at 22050 Hz
-BANDWIDTH_NORMS = {
-    "male":   {"mean": 1500, "std": 450},
-    "female": {"mean": 1900, "std": 500},
-    "other":  {"mean": 1700, "std": 475},
+# F0 norms by gender (Hz) — conversational speech
+F0_NORMS = {
+    "male":   {"mean": 130, "low_threshold": 85,  "very_low": 65},
+    "female": {"mean": 210, "low_threshold": 140, "very_low": 100},
+    "other":  {"mean": 165, "low_threshold": 110, "very_low": 80},
 }
 
-# Spectral rolloff norms (Hz) — where 85% of energy lives
-# Normal speech has energy spread up to 4-5 kHz; growl concentrates below 2 kHz
-ROLLOFF_NORMS = {
-    "male":   {"healthy_floor": 2200},
-    "female": {"healthy_floor": 2800},
-    "other":  {"healthy_floor": 2500},
-}
+# CPP norms (dB) — from clinical literature
+# Normal ≈ 8-14 dB, Dysphonic ≈ 3-7 dB, Severe ≈ <3 dB
+CPP_NORMS = {"healthy_floor": 7.0, "severe_floor": 3.0}
 
-SYLLABLE_RATE_NORM = {"mean": 4.5, "std": 1.5}
+# Expected syllable rate for "normal conversational speech"
+EXPECTED_SYL_RATE = 4.5  # syllables per second
 
 
 # ---------------------------------------------------------------------------
-# Non-linear mapping helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _sigmoid(x: float, midpoint: float, slope: float) -> float:
-    """Logistic sigmoid mapped to [0, 1]."""
     z = np.clip(slope * (x - midpoint), -500, 500)
     return float(1.0 / (1.0 + np.exp(-z)))
 
 
 def _tension_curve(raw_strain: float) -> float:
     """
-    Maps composite strain (0-1+) to tension score (0-100).
-
-    Calibration targets:
-      raw_strain ~0.08-0.15 (normal speech)   ->  tension  5-20
-      raw_strain ~0.25-0.35 (mild strain)     ->  tension 25-45
-      raw_strain ~0.50-0.70 (severe growl)    ->  tension 75-92
-      raw_strain ~0.80+     (extreme)         ->  tension 93-100
-
-    Sigmoid centred at 0.35 with slope 8, power-boosted at the top.
+    raw_strain 0-1 → tension 0-100.
+    Normal ~0.05-0.15 → 3-15 tension.
+    Growl  ~0.55-0.85 → 78-97 tension.
     """
-    s = _sigmoid(raw_strain, midpoint=0.35, slope=8.0)
-    s = s ** 0.85  # stretches the high end
+    s = _sigmoid(raw_strain, midpoint=0.35, slope=10.0)
     return float(np.clip(s * 100, 0, 100))
 
 
-def _vitality_from_tension(tension_score: float) -> float:
+def _vitality_from_tension(tension: float) -> float:
+    """Asymmetric inverse: low tension → high vitality plateau."""
+    raw = 1.0 - (tension / 100.0)
+    return float(np.clip((raw ** 0.6) * 100, 0, 100))
+
+
+def _cog_speed_curve(syllable_rate: float, completion_ratio: float) -> float:
     """
-    Asymmetric inverse of tension:
-      tension <25  ->  vitality 82-100
-      tension 40-60 -> vitality 40-60
-      tension >80  ->  vitality 0-18
+    Maps syllable rate to 0-100, penalised by completion ratio.
+    If someone only spoke half the expected amount, cog_speed is halved.
     """
-    raw = 1.0 - (tension_score / 100.0)
-    shaped = raw ** 0.65  # <1 exponent expands the top end
-    return float(np.clip(shaped * 100, 0, 100))
+    if syllable_rate < 0.3:
+        base = 8.0
+    else:
+        s = _sigmoid(syllable_rate, midpoint=2.5, slope=1.5)
+        base = s * 88
+        if 3.5 <= syllable_rate <= 5.5:
+            base = max(base, 70 + (syllable_rate - 3.5) * 7.5)
+        if syllable_rate > 6.0:
+            base = min(base, 85 + 2 * np.log1p(syllable_rate - 6.0))
 
-
-def _cog_speed_curve(syllable_rate: float) -> float:
-    """
-    Maps syllable rate (syl/s) to cognitive speed (0-100).
-
-    Targets:
-      0-1 syl/s    ->  10-30  (severely slow)
-      2-3 syl/s    ->  45-65  (slow but coherent)
-      3.5-5.5 syl/s -> 70-85  (normal conversational)
-      6+ syl/s     ->  85-92  (fast, soft-capped)
-    """
-    if syllable_rate < 0.5:
-        return 10.0
-
-    s = _sigmoid(syllable_rate, midpoint=2.5, slope=1.5)
-    score = s * 90
-
-    if 3.5 <= syllable_rate <= 5.5:
-        score = max(score, 70 + (syllable_rate - 3.5) * 7.5)
-
-    if syllable_rate > 6.0:
-        score = min(score, 85 + 2 * np.log1p(syllable_rate - 6.0))
-
-    return float(np.clip(score, 0, 100))
+    # Completion penalty: if they only got through 40% of expected speech,
+    # scale cog_speed down (but not below 30% of base — they still spoke)
+    penalty = 0.3 + 0.7 * np.clip(completion_ratio, 0, 1)
+    return float(np.clip(base * penalty, 0, 100))
 
 
 # ---------------------------------------------------------------------------
@@ -184,20 +152,79 @@ def _cog_speed_curve(syllable_rate: float) -> float:
 # ---------------------------------------------------------------------------
 
 def _purify(y: np.ndarray, sr: int) -> np.ndarray:
-    """Pre-emphasis -> trim silence -> min-duration gate."""
     y = np.append(y[0], y[1:] - PRE_EMPHASIS_COEFF * y[:-1])
-
     for top_db in (25, 35, 45):
-        y_trimmed, _ = librosa.effects.trim(y, top_db=top_db)
-        if len(y_trimmed) / sr >= MIN_DURATION_SEC:
-            return y_trimmed
+        yt, _ = librosa.effects.trim(y, top_db=top_db)
+        if len(yt) / sr >= MIN_DURATION_SEC:
+            return yt
+    if len(yt) / sr < 0.3:
+        raise ValueError(f"Audio too short ({len(yt)/sr:.2f}s)")
+    return yt
 
-    if len(y_trimmed) / sr < 0.3:
-        raise ValueError(
-            f"Audio too short after trimming ({len(y_trimmed)/sr:.2f}s). "
-            "Need at least 0.3s of voiced content."
-        )
-    return y_trimmed
+
+# ---------------------------------------------------------------------------
+# Cepstral Peak Prominence (CPP)
+# ---------------------------------------------------------------------------
+
+def _compute_cpp(y: np.ndarray, sr: int) -> float:
+    """
+    Cepstral Peak Prominence — the clinical gold standard for voice quality.
+
+    Process:
+    1. Compute the real cepstrum of the signal.
+    2. Find the peak in the "pitch range" of the cepstrum (quefrency
+       corresponding to 60-500 Hz).
+    3. Fit a regression line to the cepstrum in that range.
+    4. CPP = peak height above the regression line (in dB).
+
+    High CPP (>8 dB)  = clear, periodic voice (normal).
+    Low CPP  (<5 dB)  = aperiodic, noisy, or creaky (strained).
+    """
+    # Window the signal
+    n_fft = 4096  # longer window for better quefrency resolution
+    hop = 512
+
+    # Process in frames and take the mean CPP
+    cpps = []
+    for start in range(0, len(y) - n_fft, hop):
+        frame = y[start:start + n_fft]
+        # Apply Hanning window
+        frame = frame * np.hanning(n_fft)
+        # Power spectrum
+        spectrum = np.abs(np.fft.rfft(frame)) ** 2
+        # Log power spectrum (add small epsilon)
+        log_spec = np.log10(spectrum + 1e-20)
+        # Cepstrum = IFFT of log power spectrum
+        cepstrum = np.fft.irfft(log_spec)
+
+        # Quefrency range for pitch: 60-500 Hz → quefrency 2ms-16.7ms
+        q_min = int(sr / 500)   # ~44 samples at 22050
+        q_max = int(sr / 60)    # ~367 samples at 22050
+        q_max = min(q_max, len(cepstrum) - 1)
+
+        if q_min >= q_max:
+            continue
+
+        ceps_region = cepstrum[q_min:q_max]
+        quefrencies = np.arange(q_min, q_max)
+
+        # Find peak
+        peak_idx = np.argmax(ceps_region)
+        peak_val = ceps_region[peak_idx]
+
+        # Regression line through the cepstral region
+        coeffs = np.polyfit(quefrencies, ceps_region, 1)
+        regression_val = np.polyval(coeffs, quefrencies[peak_idx])
+
+        # CPP = peak above regression, converted to dB-like scale
+        cpp_frame = float(peak_val - regression_val)
+        cpps.append(cpp_frame)
+
+    if not cpps:
+        return 0.0
+
+    # Use the median (robust to outlier frames)
+    return float(np.median(cpps))
 
 
 # ---------------------------------------------------------------------------
@@ -206,70 +233,105 @@ def _purify(y: np.ndarray, sr: int) -> np.ndarray:
 
 def _extract_features(y: np.ndarray, sr: int, gender: str) -> dict:
     """
-    Extracts 5 acoustic features that cleanly separate normal speech
-    from vocal fry/growl/strain:
+    Five features designed to survive iPhone AGC:
 
-    1. harmonic_ratio  — RMS(harmonic) / RMS(total) via HPSS
-    2. bandwidth_z     — spectral bandwidth z-score vs gender norms
-    3. rolloff_deficit — how far spectral rolloff drops below healthy floor
-    4. mfcc_uniformity — temporal uniformity of MFCCs 2-6 (growl=high)
-    5. syllable_rate   — articulatory events per second via spectral flux
+    1. cpp              — Cepstral Peak Prominence (voice periodicity)
+    2. f0_median        — Median fundamental frequency
+    3. f0_irregularity  — Coefficient of variation + unvoiced ratio
+    4. spectral_tilt    — Low-to-high energy ratio
+    5. syllable_rate    — Articulatory events per second
+    + completion_ratio  — Fraction of expected speech produced
     """
     features: dict = {}
     n_fft = 2048
     hop = 512
 
-    # -- 1. Harmonic-to-Total Energy Ratio -----------------------------------
-    stft_matrix = librosa.stft(y, n_fft=n_fft, hop_length=hop)
-    mag = np.abs(stft_matrix)
-    harm_mag, perc_mag = librosa.decompose.hpss(mag, margin=1.5)
+    # ── 1. CPP ──────────────────────────────────────────────────────────
+    cpp = _compute_cpp(y, sr)
+    features["cpp"] = round(cpp, 4)
 
-    rms_h = float(np.sqrt(np.mean(harm_mag ** 2)))
-    rms_t = float(np.sqrt(np.mean(mag ** 2)))
-    harmonic_ratio = rms_h / (rms_t + 1e-10)
-    features["harmonic_ratio"] = round(harmonic_ratio, 4)
-
-    # -- 2. Spectral Bandwidth -----------------------------------------------
-    spec_bw = librosa.feature.spectral_bandwidth(
-        S=mag, sr=sr, n_fft=n_fft, hop_length=hop
-    )[0]
-    mean_bw = float(np.mean(spec_bw))
-    norms = BANDWIDTH_NORMS.get(gender, BANDWIDTH_NORMS["other"])
-    bandwidth_z = (mean_bw - norms["mean"]) / norms["std"]
-    features["spectral_bandwidth_hz"] = round(mean_bw, 1)
-    features["bandwidth_z"] = round(float(bandwidth_z), 4)
-
-    # -- 3. Spectral Rolloff (85th percentile) -------------------------------
-    rolloff = librosa.feature.spectral_rolloff(
-        S=mag, sr=sr, n_fft=n_fft, hop_length=hop, roll_percent=0.85
-    )[0]
-    mean_rolloff = float(np.mean(rolloff))
-    healthy_floor = ROLLOFF_NORMS.get(gender, ROLLOFF_NORMS["other"])["healthy_floor"]
-    rolloff_deficit = np.clip((healthy_floor - mean_rolloff) / healthy_floor, 0, 1)
-    features["spectral_rolloff_hz"] = round(mean_rolloff, 1)
-    features["rolloff_deficit"] = round(float(rolloff_deficit), 4)
-
-    # -- 4. MFCC Temporal Uniformity -----------------------------------------
-    mfccs = librosa.feature.mfcc(
-        y=y, sr=sr, n_mfcc=13, n_fft=n_fft, hop_length=hop
+    # ── 2 & 3. F0 Analysis via PYIN ────────────────────────────────────
+    # PYIN is more robust than YIN for noisy/creaky voice
+    f0, voiced_flag, voiced_prob = librosa.pyin(
+        y, fmin=50, fmax=500, sr=sr, hop_length=hop,
+        fill_na=0.0  # unvoiced frames get 0
     )
-    mfcc_subset = mfccs[1:6, :]  # coefficients 2-6, shape (5, T)
-    temporal_std = np.std(mfcc_subset, axis=1)  # std across TIME per coeff
-    mean_temporal_std = float(np.mean(temporal_std))
 
-    # Normal speech: ~15-45, Growl/fry: ~3-12
-    MFCC_STD_LOW = 8.0
-    MFCC_STD_HIGH = 25.0
-    if mean_temporal_std <= MFCC_STD_LOW:
-        mfcc_uniformity = 1.0
-    elif mean_temporal_std >= MFCC_STD_HIGH:
-        mfcc_uniformity = 0.0
+    # Separate voiced frames
+    voiced_f0 = f0[voiced_flag]
+    n_total = len(f0)
+    n_voiced = len(voiced_f0)
+
+    if n_voiced > 3:
+        f0_median = float(np.median(voiced_f0))
+        f0_mean = float(np.mean(voiced_f0))
+        f0_std = float(np.std(voiced_f0))
+        f0_cv = f0_std / (f0_mean + 1e-10)  # coefficient of variation
     else:
-        mfcc_uniformity = 1.0 - (mean_temporal_std - MFCC_STD_LOW) / (MFCC_STD_HIGH - MFCC_STD_LOW)
-    features["mfcc_temporal_std"] = round(mean_temporal_std, 4)
-    features["mfcc_uniformity"] = round(float(mfcc_uniformity), 4)
+        f0_median = 0.0
+        f0_mean = 0.0
+        f0_cv = 1.0  # maximally irregular
 
-    # -- 5. Syllable Rate via Mel Spectral Flux ------------------------------
+    # Unvoiced ratio: fraction of frames where PYIN couldn't find a pitch
+    # Normal speech: ~20-40% unvoiced (consonants, pauses).
+    # Vocal fry: often 40-70% because the irregular pulses confuse PYIN.
+    unvoiced_ratio = 1.0 - (n_voiced / (n_total + 1e-10))
+
+    # Combined irregularity: CV + excess unvoiced penalty
+    # Normal: CV ~0.10-0.25, unvoiced ~0.25-0.40
+    # Growl:  CV ~0.30-0.60, unvoiced ~0.45-0.70
+    f0_irregularity = 0.5 * np.clip(f0_cv / 0.40, 0, 1) + \
+                      0.5 * np.clip((unvoiced_ratio - 0.30) / 0.35, 0, 1)
+
+    features["f0_median"] = round(f0_median, 1)
+    features["f0_mean"] = round(f0_mean, 1)
+    features["f0_cv"] = round(f0_cv, 4)
+    features["unvoiced_ratio"] = round(unvoiced_ratio, 4)
+    features["f0_irregularity"] = round(float(f0_irregularity), 4)
+
+    # ── 4. Spectral Tilt (Low-to-High Energy Ratio) ────────────────────
+    # Even with AGC, the RATIO of energy in bands is preserved.
+    # Growl: massive energy below 500 Hz, little above 2 kHz.
+    # Normal: balanced spread.
+    S = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=hop)) ** 2
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+
+    low_mask = freqs <= 500
+    high_mask = freqs >= 2000
+
+    low_energy = float(np.mean(S[low_mask, :])) + 1e-20
+    high_energy = float(np.mean(S[high_mask, :])) + 1e-20
+
+    # Ratio in dB: positive = more low energy (growl-like)
+    spectral_tilt_db = 10 * np.log10(low_energy / high_energy)
+    features["spectral_tilt_db"] = round(spectral_tilt_db, 2)
+
+    # Normal speech: tilt ~5-15 dB (some low dominance is natural)
+    # Growl: tilt ~20-40+ dB (extreme low dominance)
+    # Normalise to 0-1 strain: 12→0, 30→1
+    tilt_strain = np.clip((spectral_tilt_db - 12) / 18, 0, 1)
+    features["tilt_strain"] = round(float(tilt_strain), 4)
+
+    # ── 5. F0 Depth Score ──────────────────────────────────────────────
+    # How abnormally low is the F0 for this gender?
+    norms = F0_NORMS.get(gender, F0_NORMS["other"])
+    if f0_median > 0:
+        # Score: how far below the "low threshold" is the F0?
+        # At or above threshold → 0. At very_low → 1.
+        threshold = norms["low_threshold"]
+        very_low = norms["very_low"]
+        if f0_median >= threshold:
+            f0_depth = 0.0
+        elif f0_median <= very_low:
+            f0_depth = 1.0
+        else:
+            f0_depth = (threshold - f0_median) / (threshold - very_low)
+    else:
+        f0_depth = 0.8  # no pitch detected → likely very abnormal
+
+    features["f0_depth"] = round(float(f0_depth), 4)
+
+    # ── 6. Syllable Rate + Completion ──────────────────────────────────
     mel_S = librosa.feature.melspectrogram(
         y=y, sr=sr, n_fft=n_fft, hop_length=hop, n_mels=80
     )
@@ -281,22 +343,30 @@ def _extract_features(y: np.ndarray, sr: int, gender: str) -> dict:
     threshold = med + 1.5 * mad
 
     min_gap_frames = max(1, int(0.12 * sr / hop))
-    peak_indices = []
-    last_peak = -min_gap_frames - 1
+    peaks = []
+    last = -min_gap_frames - 1
     for i in range(1, len(flux) - 1):
         if (flux[i] > threshold
                 and flux[i] >= flux[i - 1]
                 and flux[i] >= flux[i + 1]
-                and (i - last_peak) >= min_gap_frames):
-            peak_indices.append(i)
-            last_peak = i
+                and (i - last) >= min_gap_frames):
+            peaks.append(i)
+            last = i
 
-    n_onsets = len(peak_indices)
     duration_sec = len(y) / sr
+    n_onsets = len(peaks)
     syllable_rate = n_onsets / duration_sec if duration_sec > 0.1 else 0.0
+
+    # Completion ratio: how many syllables were produced vs. expected
+    # for this duration? If someone records 5 seconds, we'd expect
+    # ~22 syllables (4.5/s * 5s). If only 8 were detected, ratio ≈ 0.36.
+    expected_syllables = EXPECTED_SYL_RATE * duration_sec
+    completion_ratio = n_onsets / (expected_syllables + 1e-10)
+
     features["n_onsets"] = n_onsets
     features["duration_sec"] = round(duration_sec, 2)
     features["syllable_rate"] = round(syllable_rate, 2)
+    features["completion_ratio"] = round(float(np.clip(completion_ratio, 0, 1.5)), 4)
 
     return features
 
@@ -307,32 +377,43 @@ def _extract_features(y: np.ndarray, sr: int, gender: str) -> dict:
 
 def _compute_scores(features: dict, is_smoker: bool, gender: str) -> dict:
     """
-    Tension = weighted sum of 4 strain indicators, then non-linear curve.
+    Tension composite from 4 strain indicators:
 
-    Weights:
-      0.35  harmonic deficit   — strongest signal (clean vs noisy phonation)
-      0.30  rolloff deficit    — strongest single-feature discriminator
-      0.15  bandwidth deficit  — supporting evidence
-      0.20  mfcc uniformity   — temporal texture confirmation
+    1. CPP deficit     (weight 0.30) — THE clinical voice quality measure
+    2. F0 depth        (weight 0.25) — abnormally low pitch
+    3. F0 irregularity (weight 0.25) — erratic pitch + voicing dropouts
+    4. Spectral tilt   (weight 0.20) — low-frequency energy dominance
+
+    Why this works when v1/v2 didn't:
+    - CPP is a RATIO measure — AGC can't hide aperiodicity
+    - F0 is tracked by autocorrelation — AGC shifts level, not frequency
+    - Spectral tilt is an energy RATIO — AGC scales uniformly
+    - F0 irregularity catches the erratic pitch jumps of vocal fry
     """
-    hr = features["harmonic_ratio"]
-    rolloff_def = features["rolloff_deficit"]
-    bw_z = features["bandwidth_z"]
-    mfcc_unif = features["mfcc_uniformity"]
+    cpp = features["cpp"]
+    f0_depth = features["f0_depth"]
+    f0_irreg = features["f0_irregularity"]
+    tilt_strain = features["tilt_strain"]
     syl_rate = features["syllable_rate"]
+    completion = features["completion_ratio"]
 
-    # Harmonic deficit: 0.85->0, 0.50->1
-    harmonic_deficit = np.clip((0.85 - hr) / 0.35, 0, 1)
+    # ── CPP deficit (0-1) ──
+    # CPP healthy_floor=7.0, severe_floor=3.0
+    # Above 7 → deficit 0. Below 3 → deficit 1.
+    if cpp >= CPP_NORMS["healthy_floor"]:
+        cpp_deficit = 0.0
+    elif cpp <= CPP_NORMS["severe_floor"]:
+        cpp_deficit = 1.0
+    else:
+        cpp_deficit = (CPP_NORMS["healthy_floor"] - cpp) / \
+                      (CPP_NORMS["healthy_floor"] - CPP_NORMS["severe_floor"])
 
-    # Bandwidth deficit: bw_z < -1.0 suspicious, < -3.0 severe
-    bandwidth_deficit = np.clip((-1.0 - bw_z) / 2.0, 0, 1)
-
-    # Composite raw strain
+    # ── Composite raw strain ──
     raw_strain = (
-        0.35 * float(harmonic_deficit)
-        + 0.30 * float(rolloff_def)
-        + 0.15 * float(bandwidth_deficit)
-        + 0.20 * float(mfcc_unif)
+        0.30 * float(cpp_deficit)
+        + 0.25 * float(f0_depth)
+        + 0.25 * float(f0_irreg)
+        + 0.20 * float(tilt_strain)
     )
 
     if is_smoker:
@@ -340,9 +421,8 @@ def _compute_scores(features: dict, is_smoker: bool, gender: str) -> dict:
 
     tension = _tension_curve(raw_strain)
     vitality = _vitality_from_tension(tension)
-    cog_speed = _cog_speed_curve(syl_rate)
+    cog_speed = _cog_speed_curve(syl_rate, completion)
 
-    # VRS composite
     vrs = 0.35 * (100 - tension) + 0.40 * vitality + 0.25 * cog_speed
 
     return {
@@ -354,10 +434,10 @@ def _compute_scores(features: dict, is_smoker: bool, gender: str) -> dict:
             **{k: (round(v, 4) if isinstance(v, float) else v)
                for k, v in features.items()},
             "raw_strain": round(float(raw_strain), 4),
-            "harmonic_deficit": round(float(harmonic_deficit), 4),
-            "rolloff_deficit": round(float(rolloff_def), 4),
-            "bandwidth_deficit": round(float(bandwidth_deficit), 4),
-            "mfcc_uniformity": round(float(mfcc_unif), 4),
+            "cpp_deficit": round(float(cpp_deficit), 4),
+            "f0_depth": round(float(f0_depth), 4),
+            "f0_irregularity": round(float(f0_irreg), 4),
+            "tilt_strain": round(float(tilt_strain), 4),
             "is_smoker": is_smoker,
             "gender": gender,
         },
@@ -370,42 +450,28 @@ def _compute_scores(features: dict, is_smoker: bool, gender: str) -> dict:
 
 @app.post("/analyze", response_model=BiomarkerResult)
 async def analyze_voice(
-    file: UploadFile = File(..., description="Audio file (wav, mp3, m4a, ogg, flac)"),
-    is_smoker: bool = Form(False, description="Whether the speaker is a smoker"),
-    gender: str = Form("other", description="Speaker gender: male | female | other"),
+    file: UploadFile = File(..., description="Audio file"),
+    is_smoker: bool = Form(False),
+    gender: str = Form("other"),
 ):
     """
-    Upload an audio file via multipart/form-data and receive vocal
-    biomarker scores.
+    Upload audio via multipart/form-data.
 
-    **Form fields (multipart/form-data):**
-    - `file`: audio file (wav, mp3, m4a, ogg, flac, webm)
-    - `is_smoker`: string "true" or "false" (default "false")
-    - `gender`: string "male", "female", or "other" (default "other")
-
-    **Frontend integration note:**
-    Do NOT manually set Content-Type header. Let the browser set
-    multipart/form-data with the boundary automatically.
-
-    Example frontend code:
+    Frontend example:
         const formData = new FormData();
         formData.append('file', audioBlob, 'recording.wav');
         formData.append('is_smoker', isSmoker ? 'true' : 'false');
         formData.append('gender', gender || 'other');
-
-        const res = await fetch('/analyze', {
-            method: 'POST',
-            body: formData,
-            // Do NOT set Content-Type — browser handles it
-        });
+        const res = await fetch('/analyze', { method: 'POST', body: formData });
+        // Do NOT set Content-Type header — browser handles boundary
     """
     gender = gender.strip().lower()
     if gender not in ("male", "female", "other"):
         gender = "other"
 
     content = await file.read()
-    if len(content) == 0:
-        raise HTTPException(status_code=400, detail="Empty file uploaded.")
+    if not content:
+        raise HTTPException(400, "Empty file")
 
     suffix = Path(file.filename or "audio.wav").suffix or ".wav"
     try:
@@ -414,42 +480,31 @@ async def analyze_voice(
             tmp.flush()
             y, sr = librosa.load(tmp.name, sr=TARGET_SR, mono=True)
     except Exception as exc:
-        log.exception("Failed to decode audio")
-        raise HTTPException(
-            status_code=400,
-            detail=f"Could not decode audio file: {exc}",
-        )
+        log.exception("Decode failed")
+        raise HTTPException(400, f"Could not decode audio: {exc}")
 
     try:
         y = _purify(y, sr)
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
+        raise HTTPException(422, str(exc))
 
     features = _extract_features(y, sr, gender)
     log.info("Features: %s", features)
 
     scores = _compute_scores(features, is_smoker, gender)
     log.info(
-        "Scores: vrs=%.1f tension=%.1f vitality=%.1f cog=%.1f",
+        "vrs=%.1f tension=%.1f vitality=%.1f cog=%.1f",
         scores["vrs"], scores["tension"], scores["vitality"], scores["cog_speed"],
     )
 
     return BiomarkerResult(**scores)
 
 
-# ---------------------------------------------------------------------------
-# Health check
-# ---------------------------------------------------------------------------
-
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 
-# ---------------------------------------------------------------------------
-# Dev runner
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
