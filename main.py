@@ -35,9 +35,17 @@ async def analyze_voice(file: UploadFile = File(...)):
         shimmer = np.std(librosa.feature.rms(y=y)[0]) / 10
         
         # Calculate Scores
-        tension = min(100, max(0, (jitter * 500) + (shimmer * 200)))
-        vitality = 100 - (shimmer * 500)
-        vrs_score = int((100 - tension) * 0.4 + vitality * 0.6)
+               # --- TUNED CALIBRATION ---
+        # We lower the multipliers (from 500/200 to 150/100) so the score is less 'jumpy'
+        tension_raw = (jitter * 150) + (shimmer * 100)
+        tension = min(100, max(0, tension_raw))
+        
+        # Vitality is now more resilient
+        vitality_raw = 100 - (shimmer * 200)
+        vitality = min(100, max(40, vitality_raw))
+        
+        # New VRS Weighting: Vitality carries more weight for a "Wellness" feel
+        vrs_score = int((100 - tension) * 0.3 + vitality * 0.7)
 
         return {
             "vrs": vrs_score,
