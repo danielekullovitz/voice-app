@@ -40,34 +40,33 @@ async def analyze_voice(
         f0, _, _ = librosa.pyin(y_voice, fmin=75, fmax=600)
         f0_clean = f0[~np.isnan(f0)] if f0 is not None else []
         avg_f0 = np.mean(f0_clean) if len(f0_clean) > 0 else 0
+        
+        # NEW: Prosody Extraction (Pitch Variation)
+        # Measures the "melody" of your voice. Monotone/Growl = Low, Expressive = High.
+        f0_std = np.std(f0_clean) if len(f0_clean) > 1 else 0
 
         flatness = np.mean(librosa.feature.spectral_flatness(y=y_voice))
         bandwidth = np.mean(librosa.feature.spectral_bandwidth(y=y_voice))
         rms_array = librosa.feature.rms(y=y_voice)[0]
         shimmer = np.std(rms_array) / np.mean(rms_array) if np.mean(rms_array) > 0 else 0
-        
-        # NEW: Cognitive Extraction (Zero-Crossing Rate)
-        # Measures how fast the vocal tract is changing shapes (articulation)
-        zcr_array = librosa.feature.zero_crossing_rate(y=y_voice)[0]
-        zcr_var = np.var(zcr_array) * 1000  # Scale it up so we can use it
 
-        # --- 3. ENGINE V13: DECOUPLED METRICS ---
+        # --- 3. ENGINE V15: THE PROSODY UPDATE ---
         smoker_flag = is_smoker.lower() in ['true', '1', 'yes']
         base_hiss_tax = 0.0250 if smoker_flag else 0.0150
         clean_flatness = max(0, flatness - base_hiss_tax)
         
-        # TENSION (The Throat): Purely physical strain and noise.
-        tension_raw = (shimmer * 160) + (clean_flatness * 2000) + (bandwidth / 120)
-        tension = int(min(100, max(10, tension_raw - 55)))
+        # TENSION (The Throat)
+        tension_raw = (shimmer * 80) + (clean_flatness * 4500) + (bandwidth / 250)
+        tension = int(min(100, max(10, tension_raw - 20)))
         
-        # VITALITY (The Lungs/Vocal Folds): Inverse of physical strain.
-        vitality_calc = 130 - (shimmer * 350) - (tension * 0.6)
+        # VITALITY (The Lungs/Vocal Folds)
+        vitality_calc = 130 - (shimmer * 300) - (tension * 0.6)
         vitality = int(min(100, max(15, vitality_calc)))
         
-        # COG SPEED (The Brain): Based on dynamic articulation (ZCR Variance)
-        # If you are speaking words, ZCR variance is high. If you are doing a flat growl, it drops.
-        # We completely untie this from Tension!
-        cog_speed_calc = 40 + (zcr_var * 15) 
+        # COG SPEED (The Brain)
+        # Base of 40. Every 1Hz of pitch variation adds 2.5 points.
+        # A growl has ~2Hz variation (Score: 45). Normal talking has ~20Hz variation (Score: 90).
+        cog_speed_calc = 35 + (f0_std * 2.5) 
         cog_speed = int(min(100, max(20, cog_speed_calc)))
 
         # VRS: The True North Score
@@ -82,11 +81,12 @@ async def analyze_voice(
             "meta": {
                 "smoker_adjusted": smoker_flag,
                 "gender": gender,
-                "zcr_variance": f"{zcr_var:.4f}"
+                "pitch_hz": f"{avg_f0:.2f}",
+                "prosody_hz": f"{f0_std:.2f}"
             }
         }
         
-        print(f"--- ENGINE V13 COMPLETE | VRS: {vrs_score} ---")
+        print(f"--- ENGINE V15 COMPLETE | VRS: {vrs_score} ---")
         return result
 
     except Exception as e:
