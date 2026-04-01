@@ -36,41 +36,40 @@ async def analyze_voice(
         if len(y_voice) < sr * 0.5: 
             y_voice = y_filt
 
-        # 2. BIO-METRIC EXTRACTION
-        f0, _, _ = librosa.pyin(y_voice, fmin=75, fmax=600)
-        f0_clean = f0[~np.isnan(f0)] if f0 is not None else []
-        avg_f0 = np.mean(f0_clean) if len(f0_clean) > 0 else 0
+        # --- ENGINE V16: THE ARTICULATION ENGINE ---
+
+        # 1. TENSION (Throat/Noise)
+        # Median flatness ignores harsh consonants and focuses on the core vocal tone.
+        flatness_array = librosa.feature.spectral_flatness(y=y_voice)[0]
+        median_flatness = np.median(flatness_array)
         
-        # NEW: Prosody Extraction (Pitch Variation)
-        # Measures the "melody" of your voice. Monotone/Growl = Low, Expressive = High.
-        f0_std = np.std(f0_clean) if len(f0_clean) > 1 else 0
-
-        flatness = np.mean(librosa.feature.spectral_flatness(y=y_voice))
-        bandwidth = np.mean(librosa.feature.spectral_bandwidth(y=y_voice))
-        rms_array = librosa.feature.rms(y=y_voice)[0]
-        shimmer = np.std(rms_array) / np.mean(rms_array) if np.mean(rms_array) > 0 else 0
-
-        # --- 3. ENGINE V15: THE PROSODY UPDATE ---
         smoker_flag = is_smoker.lower() in ['true', '1', 'yes']
-        base_hiss_tax = 0.0250 if smoker_flag else 0.0150
-        clean_flatness = max(0, flatness - base_hiss_tax)
+        base_hiss_tax = 0.0100 if smoker_flag else 0.0050
+        clean_flatness = max(0, median_flatness - base_hiss_tax)
         
-        # TENSION (The Throat)
-        tension_raw = (shimmer * 80) + (clean_flatness * 4500) + (bandwidth / 250)
-        tension = int(min(100, max(10, tension_raw - 20)))
-        
-        # VITALITY (The Lungs/Vocal Folds)
-        vitality_calc = 130 - (shimmer * 300) - (tension * 0.6)
-        vitality = int(min(100, max(15, vitality_calc)))
-        
-        # COG SPEED (The Brain)
-        # Base of 40. Every 1Hz of pitch variation adds 2.5 points.
-        # A growl has ~2Hz variation (Score: 45). Normal talking has ~20Hz variation (Score: 90).
-        cog_speed_calc = 35 + (f0_std * 2.5) 
-        cog_speed = int(min(100, max(20, cog_speed_calc)))
+        # Massive multiplier because normal median flatness is tiny (~0.001)
+        tension = int(min(100, max(5, clean_flatness * 6000)))
 
-        # VRS: The True North Score
-        vrs_score = int(((100 - (tension * 1.1)) + vitality) / 2)
+        # 2. VITALITY (Energy & Expression)
+        # Normal speech has high dynamic range (pauses, loud/soft). Monotone strain has low.
+        rms_array = librosa.feature.rms(y=y_voice)[0]
+        dynamic_range = np.std(rms_array) / np.mean(rms_array) if np.mean(rms_array) > 0 else 0
+        
+        vitality_calc = 100 - tension + (dynamic_range * 15)
+        vitality = int(min(100, max(10, vitality_calc)))
+
+        # 3. COG SPEED (Brain/Articulation)
+        # Count actual word attacks (syllables) per second. Ignores tone entirely!
+        onsets = librosa.onset.onset_detect(y=y_voice, sr=sr, backtrack=False)
+        duration = len(y_voice) / sr
+        articulation_rate = len(onsets) / duration if duration > 0 else 0
+        
+        # Normal conversational speech is ~3.5 to 5 onsets per second.
+        cog_speed_calc = int(articulation_rate * 22)
+        cog_speed = int(min(100, max(10, cog_speed_calc)))
+
+        # 4. FINAL VRS
+        vrs_score = int(((100 - tension) * 0.6) + (vitality * 0.2) + (cog_speed * 0.2))
         vrs_score = max(5, min(98, vrs_score))
 
         result = {
@@ -79,14 +78,13 @@ async def analyze_voice(
             "vitality": vitality,
             "cog_speed": cog_speed,
             "meta": {
-                "smoker_adjusted": smoker_flag,
-                "gender": gender,
-                "pitch_hz": f"{avg_f0:.2f}",
-                "prosody_hz": f"{f0_std:.2f}"
+                "median_flatness": f"{median_flatness:.4f}",
+                "dynamic_range": f"{dynamic_range:.2f}",
+                "articulation_rate": f"{articulation_rate:.2f}"
             }
         }
         
-        print(f"--- ENGINE V15 COMPLETE | VRS: {vrs_score} ---")
+        print(f"--- ENGINE V16 COMPLETE | VRS: {vrs_score} ---")
         return result
 
     except Exception as e:
