@@ -37,13 +37,23 @@ async def analyze_voice(file: UploadFile = File(...)):
         # Calculate Scores
                # --- TUNED CALIBRATION ---
         # We lower the multipliers (from 500/200 to 150/100) so the score is less 'jumpy'
-        tension_raw = (jitter * 150) + (shimmer * 100)
-        tension = min(100, max(0, tension_raw))
+               # --- ENGINE V3: BIOLOGICAL BALANCE ---
+        # 1. More forgiving Jitter/Shimmer (lower multipliers)
+        jitter_score = min(100, (jitter * 80)) # Was 150
+        shimmer_score = min(100, (shimmer * 60)) # Was 100
         
-        # Vitality is now more resilient
-        vitality_raw = 100 - (shimmer * 200)
-        vitality = min(100, max(40, vitality_raw))
+        # 2. Tension is the average of instabilities
+        tension = int((jitter_score + shimmer_score) / 2)
         
+        # 3. RELATIONAL VITALITY: 
+        # High tension now "stifles" vitality. You can't have 99 Vitality if Tension is 100.
+        raw_vitality = 100 - (shimmer * 120)
+        vitality = int(raw_vitality * (1 - (tension / 250))) # Tension subtracts up to 40% of vitality
+        vitality = max(40, min(100, vitality)) # Keep it in a realistic range
+        
+        # 4. FINAL VRS (The Balance)
+        vrs_score = int((100 - tension) * 0.4 + vitality * 0.6)
+
         # New VRS Weighting: Vitality carries more weight for a "Wellness" feel
         vrs_score = int((100 - tension) * 0.3 + vitality * 0.7)
 
