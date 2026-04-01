@@ -17,71 +17,76 @@ app.add_middleware(
 
 @app.post("/analyze")
 async def analyze_voice(file: UploadFile = File(...)):
-    # Create a UNIQUE filename for every single scan
     unique_id = str(uuid.uuid4())
     temp_path = f"temp_{unique_id}_{file.filename}"
     
     try:
-        # Save uploaded file
         with open(temp_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # Load audio
+        # 1. THE VOICE PURIFIER (iPhone Optimization)
         y, sr = librosa.load(temp_path, sr=None)
         
-        # --- 1. CORE ACOUSTIC EXTRACTION ---
-        f0, voiced_flag, voiced_probs = librosa.pyin(y, fmin=75, fmax=600)
-        f0_clean = f0[~np.isnan(f0)]
-        avg_f0 = np.mean(f0_clean) if len(f0_clean) > 0 else 0
+        # Pre-emphasis (Sharps the vocal signal, dulls the hiss)
+        y_filt = librosa.effects.preemphasis(y)
         
-        # Stability & Purity Measures
-        rms = librosa.feature.rms(y=y)[0]
-        shimmer = np.std(rms) / np.mean(rms) if np.mean(rms) > 0 else 0
-        flatness = np.mean(librosa.feature.spectral_flatness(y=y))
-        bandwidth = np.mean(librosa.feature.spectral_bandwidth(y=y))
+        # Strict Trim (Ignore silence or handling noise)
+        y_voice, _ = librosa.effects.trim(y_filt, top_db=20) 
 
-        # --- 2. ENGINE V7: THE HARMONIC HERO ---
+        # CRITICAL FIX: If the trim cuts too much (e.g., quiet recording), fallback to original
+        if len(y_voice) < sr * 0.5: 
+            y_voice = y_filt
+
+        # 2. BIO-METRIC EXTRACTION
+        # Silently extract Pitch (F0) for future database profiling
+        f0, _, _ = librosa.pyin(y_voice, fmin=75, fmax=600)
+        f0_clean = f0[~np.isnan(f0)] if f0 is not None else []
+        avg_f0 = np.mean(f0_clean) if len(f0_clean) > 0 else 0
+
+        # Purity Metrics
+        flatness = np.mean(librosa.feature.spectral_flatness(y=y_voice))
+        bandwidth = np.mean(librosa.feature.spectral_bandwidth(y=y_voice))
         
-        # TENSION: We focus on Shimmer (crackling) and Bandwidth (noise/growl).
-        # A growl is "wide" noise (High Bandwidth). A clear voice is "narrow" (Low Bandwidth).
-        tension_calc = (shimmer * 200) + (flatness * 1800) + (bandwidth / 80)
-        # Calibration shift: Normal voice should sit at 15-25 Tension.
-        tension = int(min(100, max(15, tension_calc - 35)))
+        # Stability Metrics
+        rms_array = librosa.feature.rms(y=y_voice)[0]
+        shimmer = np.std(rms_array) / np.mean(rms_array) if np.mean(rms_array) > 0 else 0
+
+        # 3. ENGINE V10 LOGIC: BULLETPROOF CALIBRATION
+        clean_flatness = max(0, flatness - 0.0150)
         
-        # VITALITY: A clear voice is "Peaky". 
-        # High Flatness (noise) and High Bandwidth (messiness) CRUSH vitality.
-        vitality_calc = 125 - (flatness * 2200) - (bandwidth / 40)
-        vitality = int(min(100, max(10, vitality_calc)))
+        # TENSION
+        tension_raw = (shimmer * 120) + (clean_flatness * 2500) + (bandwidth / 150)
+        tension = int(min(100, max(12, tension_raw - 45)))
         
-        # VRS: The Final Score
-        # We weight Tension heavily. If you have 80 Tension, your score is dead.
-        vrs_score = int(((100 - tension) * 0.75) + (vitality * 0.25))
+        # VITALITY
+        vitality_calc = 135 - (clean_flatness * 3000) - (bandwidth / 60)
+        vitality = int(min(100, max(15, vitality_calc)))
+        
+        # VRS: The Health Score
+        vrs_score = int(((100 - (tension * 1.1)) + vitality) / 2)
         vrs_score = max(5, min(98, vrs_score))
         
-        # COG SPEED: Based on Spectral Flatness (Clarity).
-        # "Clear Voice = Clear Mind."
-        cog_speed = int(max(30, 98 - (flatness * 2500)))
+        # COG SPEED
+        cog_speed = int(max(40, 102 - (clean_flatness * 2800)))
 
         result = {
             "vrs": vrs_score,
             "tension": tension,
             "vitality": vitality,
-            "cog_speed": cog_speed,
-            "debug": {
-                "flatness": f"{flatness:.4f}",
-                "bandwidth": f"{bandwidth:.2f}",
-                "shimmer": f"{shimmer:.2%}"
+            "cog_speed": min(100, cog_speed),
+            "meta": {
+                "raw_flatness": f"{flatness:.4f}", 
+                "pitch_hz": f"{avg_f0:.2f}",
+                "mic_type": "iPhone Optimized v10"
             }
         }
         
-        print(f"--- ENGINE V7 COMPLETE: {result} ---")
+        print(f"--- ENGINE V10 PRO COMPLETE: {result} ---")
         return result
 
     except Exception as e:
         print(f"ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        # Clean up the file
         if os.path.exists(temp_path):
             os.remove(temp_path)
-
