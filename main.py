@@ -18,8 +18,8 @@ app.add_middleware(
 @app.post("/analyze")
 async def analyze_voice(
     file: UploadFile = File(...),
-    is_smoker: str = Form("false"),  # NEW: Catch the smoker status
-    gender: str = Form("unspecified") # NEW: Catch the gender
+    is_smoker: str = Form("false"),
+    gender: str = Form("unspecified")
 ):
     unique_id = str(uuid.uuid4())
     temp_path = f"temp_{unique_id}_{file.filename}"
@@ -33,7 +33,6 @@ async def analyze_voice(
         y_filt = librosa.effects.preemphasis(y)
         y_voice, _ = librosa.effects.trim(y_filt, top_db=20) 
 
-        # Safety fallback for quiet rooms
         if len(y_voice) < sr * 0.5: 
             y_voice = y_filt
 
@@ -46,44 +45,48 @@ async def analyze_voice(
         bandwidth = np.mean(librosa.feature.spectral_bandwidth(y=y_voice))
         rms_array = librosa.feature.rms(y=y_voice)[0]
         shimmer = np.std(rms_array) / np.mean(rms_array) if np.mean(rms_array) > 0 else 0
+        
+        # NEW: Cognitive Extraction (Zero-Crossing Rate)
+        # Measures how fast the vocal tract is changing shapes (articulation)
+        zcr_array = librosa.feature.zero_crossing_rate(y=y_voice)[0]
+        zcr_var = np.var(zcr_array) * 1000  # Scale it up so we can use it
 
-        # --- 3. ENGINE V11: THE CONTEXT CALIBRATOR ---
-        
-        # Convert string flag to boolean
+        # --- 3. ENGINE V13: DECOUPLED METRICS ---
         smoker_flag = is_smoker.lower() in ['true', '1', 'yes']
-        
-        # THE SMOKER's BUFFER: Give them a higher "forgiveness" for vocal noise
         base_hiss_tax = 0.0250 if smoker_flag else 0.0150
         clean_flatness = max(0, flatness - base_hiss_tax)
         
-        # TENSION
-        tension_raw = (shimmer * 120) + (clean_flatness * 2500) + (bandwidth / 150)
-        tension = int(min(100, max(12, tension_raw - 45)))
+        # TENSION (The Throat): Purely physical strain and noise.
+        tension_raw = (shimmer * 160) + (clean_flatness * 2000) + (bandwidth / 120)
+        tension = int(min(100, max(10, tension_raw - 55)))
         
-        # VITALITY
-        vitality_calc = 135 - (clean_flatness * 3000) - (bandwidth / 60)
+        # VITALITY (The Lungs/Vocal Folds): Inverse of physical strain.
+        vitality_calc = 130 - (shimmer * 350) - (tension * 0.6)
         vitality = int(min(100, max(15, vitality_calc)))
         
-        # VRS: The Health Score
+        # COG SPEED (The Brain): Based on dynamic articulation (ZCR Variance)
+        # If you are speaking words, ZCR variance is high. If you are doing a flat growl, it drops.
+        # We completely untie this from Tension!
+        cog_speed_calc = 40 + (zcr_var * 15) 
+        cog_speed = int(min(100, max(20, cog_speed_calc)))
+
+        # VRS: The True North Score
         vrs_score = int(((100 - (tension * 1.1)) + vitality) / 2)
         vrs_score = max(5, min(98, vrs_score))
-        
-        # COG SPEED
-        cog_speed = int(max(40, 102 - (clean_flatness * 2800)))
 
         result = {
             "vrs": vrs_score,
             "tension": tension,
             "vitality": vitality,
-            "cog_speed": min(100, cog_speed),
+            "cog_speed": cog_speed,
             "meta": {
                 "smoker_adjusted": smoker_flag,
                 "gender": gender,
-                "pitch_hz": f"{avg_f0:.2f}"
+                "zcr_variance": f"{zcr_var:.4f}"
             }
         }
         
-        print(f"--- ENGINE V11 COMPLETE (Smoker: {smoker_flag}) ---")
+        print(f"--- ENGINE V13 COMPLETE | VRS: {vrs_score} ---")
         return result
 
     except Exception as e:
